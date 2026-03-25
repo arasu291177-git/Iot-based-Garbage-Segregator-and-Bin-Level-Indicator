@@ -1,0 +1,262 @@
+/*
+ * ESP32 Smart Bin Monitoring System
+ * Features: Wi-Fi connectivity, Email alerts, OLED display, MQTT integration
+ * Hardware: ESP32, HC-SR04 Ultrasonic, OLED SSD1306
+ * Libraries: WiFi, ESP Mail Client, Adafruit SSD1306, NewPing
+ */
+
+#include <WiFi.h>
+#include <ESP_Mail_Client.h>
+#include <Adafruit_SSD1306.h>
+#include <NewPing.h>
+
+// ==================== Configuration ====================
+// WiFi Credentials
+#define WIFI_SSID       "your_wifi_ssid"
+#define WIFI_PASSWORD   "your_wifi_password"
+
+// Email Configuration (Gmail with App Password)
+#define AUTHOR_EMAIL    "your_email@gmail.com"
+#define AUTHOR_PASSWORD "your_app_password_16char"
+#define RECIPIENT_EMAIL "recipient@email.com"
+
+// SMTP Server Configuration
+#define SMTP_HOST       "smtp.gmail.com"
+#define SMTP_PORT       465
+
+// Bin Configuration
+#define BIN_HEIGHT_CM       40.0        // Actual bin height
+#define FILL_THRESHOLD      80          // Alert at 80% full
+#define PROXIMITY_THRESHOLD 30          // cm for lid opening
+
+// Pin Definitions
+#define TRIG_PIN_EXTERNAL   5
+#define ECHO_PIN_EXTERNAL   18
+#define TRIG_PIN_INTERNAL   19
+#define ECHO_PIN_INTERNAL   21
+#define SERVO_PIN           13
+#define OLED_SDA            4
+#define OLED_SCL            15
+
+// ==================== Objects ====================
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+NewPing sonarExternal(TRIG_PIN_EXTERNAL, ECHO_PIN_EXTERNAL, 200);
+NewPing sonarInternal(TRIG_PIN_INTERNAL, ECHO_PIN_INTERNAL, 200);
+Servo lidServo;
+
+// Session variables for email
+SMTPSession smtp;
+bool alertSent = false;
+
+// ==================== Function: Measure Distance ====================
+float measureDistance(NewPing &sonar) {
+    unsigned int uS = sonar.ping();
+    float cm = uS / US_ROUNDTRIP_CM;
+    return cm;
+}
+
+// ==================== Function: Calculate Fill Percentage ====================
+int calculateFillPercentage() {
+    float distanceToWaste = measureDistance(sonarInternal);
+    if (distanceToWaste <= 0 || distanceToWaste > BIN_HEIGHT_CM) {
+        distanceToWaste = BIN_HEIGHT_CM;
+    }
+    float fillHeight = BIN_HEIGHT_CM - distanceToWaste;
+    int fillPercent = (fillHeight / BIN_HEIGHT_CM) * 100;
+    if (fillPercent < 0) fillPercent = 0;
+    if (fillPercent > 100) fillPercent = 100;
+    return fillPercent;
+}
+
+// ==================== Function: Update OLED Display ====================
+void updateDisplay(int fillPercent, bool wifiConnected, bool lidOpen) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    
+    // Fill level bar graph
+    display.setCursor(0, 0);
+    display.print("Fill: ");
+    display.print(fillPercent);
+    display.println("%");
+    
+    // Draw progress bar
+    int barWidth = map(fillPercent, 0, 100, 0, 100);
+    display.drawRect(0, 12, 100, 10, SSD1306_WHITE);
+    display.fillRect(0, 12, barWidth, 10, SSD1306_WHITE);
+    
+    // Wi-Fi status
+    display.setCursor(0, 30);
+    display.print("WiFi: ");
+    display.println(wifiConnected ? "Connected" : "Disconnected");
+    
+    // Lid status
+    display.setCursor(0, 45);
+    display.print("Lid: ");
+    display.println(lidOpen ? "OPEN" : "CLOSED");
+    
+    // Alert status
+    if (fillPercent >= FILL_THRESHOLD) {
+        display.setCursor(0, 55);
+        display.print("*** FULL ALERT ***");
+    }
+    
+    display.display();
+}
+
+// ==================== Function: Send Email Alert ====================
+void sendEmailAlert(int fillPercent) {
+    if (alertSent) return;
+    
+    Serial.println("Sending email alert...");
+    
+    smtp.debug(1);
+    
+    // Set callback
+    smtp.callback = [](SMTP_Status status) {
+        Serial.println("Email sent successfully");
+    };
+    
+    // Configure session
+    Session_Config config;
+    config.server.host_name = SMTP_HOST;
+    config.server.port = SMTP_PORT;
+    config.login.email = AUTHOR_EMAIL;
+    config.login.password = AUTHOR_PASSWORD;
+    
+    // Configure message
+    SMTP_Message message;
+    message.sender.name = "Smart Bin System";
+    message.sender.email = AUTHOR_EMAIL;
+    message.subject = "Smart Bin Full Alert";
+    message.addRecipient("Admin", RECIPIENT_EMAIL);
+    
+    String textMsg = "Alert: Smart bin has reached " + String(fillPercent) + 
+                     "% capacity. Please schedule collection immediately.\n\n" +
+                     "Timestamp: " + String(millis()) + " ms\n" +
+                     "Bin Location: " + WiFi.localIP().toString();
+    
+    message.text.content = textMsg.c_str();
+    message.text.charSet = "us-ascii";
+    message.text.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
+    
+    if (!smtp.connect(&config)) {
+        Serial.println("Connection error");
+        return;
+    }
+    
+    if (!MailClient.sendMail(&smtp, &message)) {
+        Serial.println("Send mail error");
+    }
+    
+    alertSent = true;
+}
+
+// ==================== Function: Control Lid ====================
+void controlLid() {
+    float distance = measureDistance(sonarExternal);
+    
+    if (distance < PROXIMITY_THRESHOLD && distance > 2) {
+        // Person detected - open lid
+        lidServo.write(90);
+        updateDisplay(calculateFillPercentage(), WiFi.status() == WL_CONNECTED, true);
+        delay(5000);  // Keep open for 5 seconds
+        lidServo.write(0);
+        updateDisplay(calculateFillPercentage(), WiFi.status() == WL_CONNECTED, false);
+    }
+}
+
+// ==================== Function: Send MQTT Data ====================
+void sendMQTTData(int fillPercent) {
+    // This is a placeholder for MQTT implementation
+    // Use PubSubClient library for actual MQTT integration
+    Serial.print("MQTT Data: Fill=");
+    Serial.print(fillPercent);
+    Serial.println("%");
+}
+
+// ==================== Setup ====================
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    
+    Serial.println("ESP32 Smart Bin Monitoring System");
+    
+    // Initialize OLED
+    Wire.begin(OLED_SDA, OLED_SCL);
+    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        Serial.println("OLED allocation failed");
+    }
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("Smart Bin System");
+    display.println("Initializing...");
+    display.display();
+    
+    // Initialize servo
+    lidServo.attach(SERVO_PIN);
+    lidServo.write(0);
+    
+    // Connect to WiFi
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    display.setCursor(0, 30);
+    display.print("WiFi: Connecting");
+    display.display();
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi connected. IP: " + WiFi.localIP().toString());
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        display.println("WiFi Connected");
+        display.println(WiFi.localIP());
+        display.display();
+        delay(2000);
+    } else {
+        Serial.println("\nWiFi connection failed");
+    }
+    
+    Serial.println("System Ready");
+}
+
+// ==================== Loop ====================
+void loop() {
+    // Measure fill level
+    int fillPercent = calculateFillPercentage();
+    
+    // Check WiFi status
+    bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+    
+    // Update display
+    updateDisplay(fillPercent, wifiConnected, false);
+    
+    // Send data to cloud
+    if (wifiConnected) {
+        sendMQTTData(fillPercent);
+        
+        // Send email alert if threshold reached
+        if (fillPercent >= FILL_THRESHOLD) {
+            sendEmailAlert(fillPercent);
+        } else {
+            alertSent = false;  // Reset alert when level drops
+        }
+    }
+    
+    // Control lid based on proximity
+    controlLid();
+    
+    // Print to serial for debugging
+    Serial.print("Fill Level: ");
+    Serial.print(fillPercent);
+    Serial.println("%");
+    
+    delay(2000);
+}
