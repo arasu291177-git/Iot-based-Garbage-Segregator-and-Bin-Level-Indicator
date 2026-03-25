@@ -1,0 +1,225 @@
+/*
+ * ESP32-CAM Smart Waste Segregation System
+ * Features: AI-based waste classification using Edge Impulse
+ * Hardware: ESP32-CAM (AI-Thinker), Servo Motors
+ * Libraries: ESP32Servo, Edge Impulse SDK, WiFi
+ */
+
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <ESP32Servo.h>
+#include "DustbinFinalDataModel_inferencing.h"  // Edge Impulse model
+
+// ==================== Configuration ====================
+// WiFi Credentials
+const char* ssid = "Your_SSID";
+const char* password = "Your_PASSWORD";
+
+// Pin Definitions for ESP32-CAM (AI-Thinker)
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// Servo Pins
+#define SERVO_METAL_PIN    13
+#define SERVO_PLASTIC_PIN  12
+#define SERVO_ORGANIC_PIN  14
+#define SERVO_PAPER_PIN    15
+
+// Servo Objects
+Servo servoMetal;
+Servo servoPlastic;
+Servo servoOrganic;
+Servo servoPaper;
+
+// Classification Results
+String wasteClass = "";
+float confidence = 0;
+
+// ==================== Camera Initialization ====================
+void initCamera() {
+    camera_config_t config;
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+    config.pin_d0 = Y2_GPIO_NUM;
+    config.pin_d1 = Y3_GPIO_NUM;
+    config.pin_d2 = Y4_GPIO_NUM;
+    config.pin_d3 = Y5_GPIO_NUM;
+    config.pin_d4 = Y6_GPIO_NUM;
+    config.pin_d5 = Y7_GPIO_NUM;
+    config.pin_d6 = Y8_GPIO_NUM;
+    config.pin_d7 = Y9_GPIO_NUM;
+    config.pin_xclk = XCLK_GPIO_NUM;
+    config.pin_pclk = PCLK_GPIO_NUM;
+    config.pin_vsync = VSYNC_GPIO_NUM;
+    config.pin_href = HREF_GPIO_NUM;
+    config.pin_sscb_sda = SIOD_GPIO_NUM;
+    config.pin_sscb_scl = SIOC_GPIO_NUM;
+    config.pin_pwdn = PWDN_GPIO_NUM;
+    config.pin_reset = RESET_GPIO_NUM;
+    config.xclk_freq_hz = 20000000;
+    config.pixel_format = PIXFORMAT_JPEG;
+    config.frame_size = FRAMESIZE_QVGA;  // 320x240
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+
+    esp_err_t err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+        Serial.printf("Camera init failed with error 0x%x", err);
+        return;
+    }
+    Serial.println("Camera initialized successfully");
+}
+
+// ==================== WiFi Connection ====================
+void initWiFi() {
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting to WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi connected. IP: " + WiFi.localIP().toString());
+}
+
+// ==================== Servo Initialization ====================
+void initServos() {
+    servoMetal.attach(SERVO_METAL_PIN);
+    servoPlastic.attach(SERVO_PLASTIC_PIN);
+    servoOrganic.attach(SERVO_ORGANIC_PIN);
+    servoPaper.attach(SERVO_PAPER_PIN);
+    
+    // Set all servos to closed position (0 degrees)
+    servoMetal.write(0);
+    servoPlastic.write(0);
+    servoOrganic.write(0);
+    servoPaper.write(0);
+}
+
+// ==================== Open Appropriate Bin ====================
+void openBin(String wasteType) {
+    Serial.println("Opening bin for: " + wasteType);
+    
+    // Close all bins first
+    servoMetal.write(0);
+    servoPlastic.write(0);
+    servoOrganic.write(0);
+    servoPaper.write(0);
+    
+    delay(500);
+    
+    // Open specific bin
+    if (wasteType == "metal") {
+        servoMetal.write(90);
+        delay(3000);  // Keep open for 3 seconds
+        servoMetal.write(0);
+    }
+    else if (wasteType == "plastic") {
+        servoPlastic.write(90);
+        delay(3000);
+        servoPlastic.write(0);
+    }
+    else if (wasteType == "organic" || wasteType == "biowaste") {
+        servoOrganic.write(90);
+        delay(3000);
+        servoOrganic.write(0);
+    }
+    else if (wasteType == "paper") {
+        servoPaper.write(90);
+        delay(3000);
+        servoPaper.write(0);
+    }
+    else {
+        Serial.println("Unknown waste type: " + wasteType);
+    }
+}
+
+// ==================== Run Inference on Captured Image ====================
+void runInference() {
+    // Capture image
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        Serial.println("Camera capture failed");
+        return;
+    }
+    
+    // Prepare signal for Edge Impulse
+    signal_t signal;
+    int err = numpy::signal_from_buffer(fb->buf, fb->len, &signal);
+    if (err != 0) {
+        Serial.println("Failed to create signal");
+        esp_camera_fb_return(fb);
+        return;
+    }
+    
+    // Run classifier
+    ei_impulse_result_t result = {0};
+    err = run_classifier(&signal, &result, false);
+    
+    if (err != 0) {
+        Serial.println("Classification failed");
+        esp_camera_fb_return(fb);
+        return;
+    }
+    
+    // Find highest confidence prediction
+    float maxConfidence = 0;
+    int maxIndex = 0;
+    for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        if (result.classification[i].value > maxConfidence) {
+            maxConfidence = result.classification[i].value;
+            maxIndex = i;
+        }
+    }
+    
+    wasteClass = String(result.classification[maxIndex].label);
+    confidence = maxConfidence;
+    
+    Serial.print("Prediction: ");
+    Serial.print(wasteClass);
+    Serial.print(" (Confidence: ");
+    Serial.print(confidence * 100);
+    Serial.println("%)");
+    
+    // Open appropriate bin if confidence is high enough
+    if (confidence > 0.8) {
+        openBin(wasteClass);
+    }
+    
+    esp_camera_fb_return(fb);
+}
+
+// ==================== Setup and Loop ====================
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    
+    Serial.println("ESP32-CAM Smart Waste Segregation System");
+    Serial.println("Initializing...");
+    
+    initCamera();
+    initWiFi();
+    initServos();
+    
+    Serial.println("System ready. Place waste in front of camera.");
+}
+
+void loop() {
+    // Wait for waste detection trigger (optional: use PIR sensor)
+    // For demo, run inference every 10 seconds
+    delay(10000);
+    runInference();
+}
