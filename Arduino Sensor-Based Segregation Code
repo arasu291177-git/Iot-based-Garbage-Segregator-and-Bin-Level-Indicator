@@ -1,0 +1,211 @@
+/*
+ * Arduino Sensor-Based Waste Segregation System
+ * Features: Metal detection (inductive), Wet detection (moisture), Dry detection (capacitive)
+ * Hardware: Arduino Uno, Inductive Sensor, Raindrop Sensor, Capacitive Touch Sensor
+ * Output: LCD Display, Servo Motors
+ */
+
+#include <LiquidCrystal_I2C.h>
+#include <Servo.h>
+
+// ==================== Pin Definitions ====================
+#define INDUCTIVE_SENSOR    2   // Metal detection
+#define MOISTURE_SENSOR     A0  // Wet waste detection
+#define CAPACITIVE_SENSOR   A1  // Dry waste detection
+#define TRIG_PIN            9   // Ultrasonic trigger (fill level)
+#define ECHO_PIN            10  // Ultrasonic echo
+#define SERVO_METAL_PIN     3
+#define SERVO_WET_PIN       4
+#define SERVO_DRY_PIN       5
+#define BUZZER_PIN          6
+#define LED_RED_PIN         7
+#define LED_GREEN_PIN       8
+
+// ==================== Objects ====================
+LiquidCrystal_I2C lcd(0x27, 16, 2);  // I2C address 0x27
+Servo servoMetal;
+Servo servoWet;
+Servo servoDry;
+
+// ==================== Variables ====================
+int binHeight = 40;          // Bin height in cm
+int fillLevel = 0;           // Current fill level in cm
+int fillPercentage = 0;      // Fill percentage
+String wasteCategory = "";
+
+// ==================== Function: Measure Fill Level ====================
+int measureFillLevel() {
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+    
+    long duration = pulseIn(ECHO_PIN, HIGH);
+    int distance = duration * 0.034 / 2;  // Convert to cm
+    
+    // Fill level = bin height - distance from sensor to waste
+    int fill = binHeight - distance;
+    if (fill < 0) fill = 0;
+    if (fill > binHeight) fill = binHeight;
+    
+    return fill;
+}
+
+// ==================== Function: Update Display ====================
+void updateDisplay(int fillCm, int fillPercent, String category) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Fill: ");
+    lcd.print(fillCm);
+    lcd.print("cm (");
+    lcd.print(fillPercent);
+    lcd.print("%)");
+    
+    lcd.setCursor(0, 1);
+    lcd.print("Type: ");
+    lcd.print(category);
+}
+
+// ==================== Function: Check Waste Type ====================
+String classifyWaste() {
+    bool isMetal = digitalRead(INDUCTIVE_SENSOR) == HIGH;
+    int moistureValue = analogRead(MOISTURE_SENSOR);
+    int capacitiveValue = analogRead(CAPACITIVE_SENSOR);
+    
+    Serial.print("Metal: ");
+    Serial.print(isMetal);
+    Serial.print(" | Moisture: ");
+    Serial.print(moistureValue);
+    Serial.print(" | Capacitive: ");
+    Serial.println(capacitiveValue);
+    
+    if (isMetal) {
+        return "METAL";
+    }
+    else if (moistureValue < 500) {  // Wet waste gives lower resistance
+        return "WET/ORGANIC";
+    }
+    else if (capacitiveValue > 200) {  // Dry waste (plastic, paper)
+        return "DRY";
+    }
+    else {
+        return "UNKNOWN";
+    }
+}
+
+// ==================== Function: Open Bin ====================
+void openBin(String category) {
+    // Close all bins first
+    servoMetal.write(0);
+    servoWet.write(0);
+    servoDry.write(0);
+    delay(500);
+    
+    if (category == "METAL") {
+        servoMetal.write(90);
+        delay(3000);
+        servoMetal.write(0);
+    }
+    else if (category == "WET/ORGANIC") {
+        servoWet.write(90);
+        delay(3000);
+        servoWet.write(0);
+    }
+    else if (category == "DRY") {
+        servoDry.write(90);
+        delay(3000);
+        servoDry.write(0);
+    }
+    else {
+        // Unknown waste - don't open any bin, maybe alert
+        digitalWrite(BUZZER_PIN, HIGH);
+        delay(1000);
+        digitalWrite(BUZZER_PIN, LOW);
+    }
+}
+
+// ==================== Function: Check Full Alert ====================
+void checkFullAlert(int percentage) {
+    if (percentage >= 90) {
+        digitalWrite(LED_RED_PIN, HIGH);
+        digitalWrite(LED_GREEN_PIN, LOW);
+        tone(BUZZER_PIN, 1000, 500);
+    }
+    else if (percentage >= 70) {
+        digitalWrite(LED_RED_PIN, LOW);
+        digitalWrite(LED_GREEN_PIN, HIGH);
+    }
+    else {
+        digitalWrite(LED_RED_PIN, LOW);
+        digitalWrite(LED_GREEN_PIN, HIGH);
+    }
+}
+
+// ==================== Setup ====================
+void setup() {
+    Serial.begin(9600);
+    
+    // Initialize pins
+    pinMode(INDUCTIVE_SENSOR, INPUT);
+    pinMode(MOISTURE_SENSOR, INPUT);
+    pinMode(CAPACITIVE_SENSOR, INPUT);
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+    pinMode(BUZZER_PIN, OUTPUT);
+    pinMode(LED_RED_PIN, OUTPUT);
+    pinMode(LED_GREEN_PIN, OUTPUT);
+    
+    // Initialize servos
+    servoMetal.attach(SERVO_METAL_PIN);
+    servoWet.attach(SERVO_WET_PIN);
+    servoDry.attach(SERVO_DRY_PIN);
+    
+    servoMetal.write(0);
+    servoWet.write(0);
+    servoDry.write(0);
+    
+    // Initialize LCD
+    lcd.init();
+    lcd.backlight();
+    lcd.setCursor(0, 0);
+    lcd.print("Smart Waste Bin");
+    lcd.setCursor(0, 1);
+    lcd.print("Initializing...");
+    delay(2000);
+    
+    Serial.println("System Ready");
+}
+
+// ==================== Loop ====================
+void loop() {
+    // Measure fill level
+    fillLevel = measureFillLevel();
+    fillPercentage = (fillLevel * 100) / binHeight;
+    
+    // Classify waste (simulate - in real system, trigger on object detection)
+    wasteCategory = classifyWaste();
+    
+    // Update display
+    updateDisplay(fillLevel, fillPercentage, wasteCategory);
+    
+    // Open appropriate bin (triggered by proximity sensor in real system)
+    // For demo: if waste detected, open bin
+    if (digitalRead(INDUCTIVE_SENSOR) == HIGH || 
+        analogRead(MOISTURE_SENSOR) < 500 || 
+        analogRead(CAPACITIVE_SENSOR) > 200) {
+        openBin(wasteCategory);
+        delay(1000);
+    }
+    
+    // Check and alert if bin is full
+    checkFullAlert(fillPercentage);
+    
+    // Send data to serial for IoT transmission
+    Serial.print("FILL_LEVEL:");
+    Serial.print(fillPercentage);
+    Serial.print(",CATEGORY:");
+    Serial.println(wasteCategory);
+    
+    delay(2000);  // Update every 2 seconds
+}
