@@ -1,0 +1,225 @@
+"""
+Python Server for YOLO-Based Waste Classification
+Features: REST API for image classification, YOLO model inference
+Technologies: Flask, YOLO, Docker
+"""
+
+import os
+import uuid
+from datetime import datetime
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from ultralytics import YOLO
+import cv2
+import numpy as np
+from pathlib import Path
+
+# ==================== Configuration ====================
+app = Flask(__name__)
+CORS(app)  # Enable CORS for ESP32-CAM
+
+# Model configuration
+MODEL_PATH = "models/yolo11s_640x640_2-1.pt"  # Path to YOLO model
+CONFIDENCE_THRESHOLD = 0.5
+
+# Directories
+IMAGE_SAVE_DIR = "images"
+os.makedirs(IMAGE_SAVE_DIR, exist_ok=True)
+
+# Waste class mapping (based on model training)
+WASTE_CLASSES = {
+    0: "metal",
+    1: "plastic",
+    2: "paper",
+    3: "glass",
+    4: "organic",
+    5: "ewaste"
+}
+
+# ==================== Load Model ====================
+print("Loading YOLO model...")
+try:
+    model = YOLO(MODEL_PATH)
+    print("Model loaded successfully")
+except Exception as e:
+    print(f"Error loading model: {e}")
+    model = None
+
+# ==================== Helper Functions ====================
+def save_image(image_data, filename):
+    """Save image to disk"""
+    filepath = os.path.join(IMAGE_SAVE_DIR, filename)
+    with open(filepath, 'wb') as f:
+        f.write(image_data)
+    return filepath
+
+def classify_image(image_path):
+    """Run YOLO inference on image"""
+    if model is None:
+        return {"error": "Model not loaded"}
+    
+    # Run inference
+    results = model(image_path, conf=CONFIDENCE_THRESHOLD)
+    
+    # Extract predictions
+    predictions = []
+    for result in results:
+        boxes = result.boxes
+        if boxes is not None:
+            for box in boxes:
+                class_id = int(box.cls[0])
+                confidence = float(box.conf[0])
+                class_name = WASTE_CLASSES.get(class_id, "unknown")
+                
+                predictions.append({
+                    "class": class_name,
+                    "class_id": class_id,
+                    "confidence": confidence
+                })
+    
+    # Determine primary class (highest confidence)
+    if predictions:
+        primary = max(predictions, key=lambda x: x["confidence"])
+        return {
+            "success": True,
+            "primary_class": primary["class"],
+            "primary_confidence": primary["confidence"],
+            "all_predictions": predictions,
+            "timestamp": datetime.now().isoformat()
+        }
+    else:
+        return {
+            "success": True,
+            "primary_class": "unknown",
+            "primary_confidence": 0,
+            "all_predictions": [],
+            "timestamp": datetime.now().isoformat()
+        }
+
+# ==================== API Endpoints ====================
+@app.route('/', methods=['GET'])
+def index():
+    """Root endpoint - returns server info"""
+    return jsonify({
+        "service": "Waste Classification Server",
+        "status": "running",
+        "model": MODEL_PATH,
+        "endpoints": {
+            "classify": "POST /classify - Send image for classification",
+            "health": "GET /health - Check server status"
+        }
+    })
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "model_loaded": model is not None,
+        "timestamp": datetime.now().isoformat()
+    })
+
+@app.route('/classify', methods=['POST'])
+def classify():
+    """
+    Classify waste from uploaded image
+    Expected: multipart/form-data with field 'image'
+    """
+    # Check if image was uploaded
+    if 'image' not in request.files:
+        return jsonify({"error": "No image provided"}), 400
+    
+    image_file = request.files['image']
+    
+    if image_file.filename == '':
+        return jsonify({"error": "Empty filename"}), 400
+    
+    # Generate unique filename
+    ext = image_file.filename.rsplit('.', 1)[-1].lower()
+    if ext not in ['jpg', 'jpeg', 'png']:
+        ext = 'jpg'
+    
+    filename = f"{uuid.uuid4().hex}.{ext}"
+    image_data = image_file.read()
+    
+    # Save image
+    image_path = save_image(image_data, filename)
+    print(f"Image saved: {image_path}")
+    
+    # Classify
+    result = classify_image(image_path)
+    
+    # Add image path to result
+    result["image_path"] = image_path
+    
+    return jsonify(result)
+
+@app.route('/classify-base64', methods=['POST'])
+def classify_base64():
+    """
+    Classify waste from base64 encoded image
+    Expected JSON: {"image": "base64_string"}
+    """
+    data = request.get_json()
+    
+    if not data or 'image' not in data:
+        return jsonify({"error": "No image data provided"}), 400
+    
+    import base64
+    image_base64 = data['image']
+    
+    # Decode base64
+    try:
+        image_data = base64.b64decode(image_base64)
+    except Exception as e:
+        return jsonify({"error": f"Invalid base64: {e}"}), 400
+    
+    # Generate filename
+    filename = f"{uuid.uuid4().hex}.jpg"
+    image_path = save_image(image_data, filename)
+    
+    # Classify
+    result = classify_image(image_path)
+    result["image_path"] = image_path
+    
+    return jsonify(result)
+
+# ==================== Model Selection Endpoint ====================
+@app.route('/models', methods=['GET'])
+def list_models():
+    """List available models"""
+    model_dir = Path("models")
+    models = [f.name for f in model_dir.glob("*.pt")]
+    return jsonify({
+        "models": models,
+        "current": MODEL_PATH
+    })
+
+@app.route('/select-model', methods=['POST'])
+def select_model():
+    """Switch to a different model"""
+    data = request.get_json()
+    model_name = data.get('model')
+    
+    global model, MODEL_PATH
+    
+    new_path = f"models/{model_name}"
+    if not os.path.exists(new_path):
+        return jsonify({"error": f"Model {model_name} not found"}), 404
+    
+    try:
+        new_model = YOLO(new_path)
+        model = new_model
+        MODEL_PATH = new_path
+        return jsonify({
+            "success": True,
+            "model": MODEL_PATH,
+            "message": f"Switched to {model_name}"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ==================== Run Server ====================
+if __name__ == '__main__':
+    # Run with debug=True for development
+    app.run(host='0.0.0.0', port=5000, debug=True)
